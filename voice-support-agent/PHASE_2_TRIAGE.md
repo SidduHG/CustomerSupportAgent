@@ -14,7 +14,7 @@ This is the core of the project. By the end you have:
 - **Confidence gate** that routes every call: auto-resolve, clarify, or escalate
 - **Stateful handoff** — the human agent sees the full transcript and context
 
-Phase 1 is a prerequisite. This phase extends it; nothing is rewritten.
+Phase 1 is a prerequisite. This phase extends it; nothing is rewritten — including the KB MCP's hybrid search (vector + BM25 + rerank), which the Resolver keeps using as-is. The one new wrinkle: `search_kb` now returns **scored, cited excerpts** (`rerank_score` + source document/section), and Phase 2 puts that score to work as the `answer_conf` input to the confidence gate — see Step 7.
 
 ---
 
@@ -70,7 +70,7 @@ voice-support-triage/
 │   ├── config.py                 # add confidence thresholds
 │   ├── pipeline.py               # updated: multi-agent Pipecat flow
 │   ├── classifier.py             # NEW: Classifier agent
-│   ├── resolver.py               # updated: more tools (CRM + Email)
+│   ├── resolver.py               # updated: more tools (CRM + Email) + maps hybrid-search rerank_score → answer_conf
 │   ├── escalator.py              # NEW: Escalator agent
 │   ├── confidence_gate.py        # NEW: gate logic
 │   ├── context.py                # NEW: shared call context dataclass
@@ -368,6 +368,7 @@ class CallContext:
     intent_tag:       Optional[str]    = None
     intent_conf:      float            = 0.0
     answer_conf:      float            = 0.0
+    kb_sources:       list[str]        = field(default_factory=list)
     tool_attempts:    list[str]        = field(default_factory=list)
     escalation_reason: Optional[str]  = None
 
@@ -377,6 +378,21 @@ class CallContext:
     def full_transcript(self) -> str:
         return "\n".join(self.transcript)
 ```
+
+> **New in Phase 2 — `kb_sources`:** every time the Resolver calls `search_kb`, the hybrid search pipeline (built in Phase 1) returns excerpts already labeled with a `rerank_score` and a source citation (`doc_name` + `section_heading`). The Resolver records those citations in `ctx.kb_sources` for the transcript/handoff, and — critically — feeds the **top result's `rerank_score` straight into `ctx.answer_conf`**. This means the confidence gate isn't guessing at how good the answer is; it's using the same relevance signal the reranker already computed:
+>
+> ```python
+> # inside the Resolver, right after calling search_kb
+> kb_results = await search_kb_raw(query)          # returns the scored, structured list (not the formatted string)
+> if kb_results:
+>     ctx.answer_conf = kb_results[0]["rerank_score"]   # top excerpt's relevance → answer confidence
+>     ctx.kb_sources  = [f"{r['metadata']['doc_name']} — {r['metadata']['section_heading']}"
+>                        for r in kb_results]
+> else:
+>     ctx.answer_conf = 0.0
+> ```
+>
+> This is the payoff of building hybrid search properly in Phase 1 — Phase 2's confidence gate gets a *real, computed* relevance score instead of an ad-hoc guess, and the human handoff dashboard (Phase 3) gets ready-made citations for free.
 
 ---
 
@@ -507,7 +523,9 @@ async def escalate(ctx: CallContext) -> str:
     })
     ticket = json.loads(ticket_result)
 
-    # Store in Redis for human agent dashboard
+    # Store in Redis for human agent dashboard — kb_sources lets the human
+    # see exactly which doc excerpts the bot already considered (and trusted
+    # how much, via answer_conf), so they don't repeat that research from scratch
     await _redis.setex(
         f"escalation:{ctx.session_id}",
         3600,  # 1 hour TTL
@@ -516,6 +534,8 @@ async def escalate(ctx: CallContext) -> str:
             "customer":      ctx.customer_name,
             "intent":        ctx.intent_tag,
             "transcript":    ctx.full_transcript(),
+            "kb_sources":    ctx.kb_sources,
+            "answer_conf":   ctx.answer_conf,
             "reason":        ctx.escalation_reason,
         }),
     )
@@ -554,8 +574,9 @@ SUPPORT_FLOW: FlowConfig = FlowConfig(
             id="understand",
             task_messages=[{
                 "role": "system",
-                "content": "Listen to the problem. Call search_kb if it's a how-to question. "
-                           "Call get_customer if they mention their email."
+                "content": "Listen to the problem. Call search_kb if it's a how-to question — "
+                           "its top result's relevance score becomes this call's answer "
+                           "confidence. Call get_customer if they mention their email."
             }],
             edges=[
                 EdgeConfig(target="resolve",   condition="confidence_high"),
@@ -639,10 +660,12 @@ pytest tests/ -v --asyncio-mode=auto
 - [ ] CRM MCP server: all 4 tools respond correctly (unit tested)
 - [ ] Email MCP server: sends a real test email
 - [ ] Classifier: returns valid JSON with intent + confidence for 10 test phrases
-- [ ] Confidence gate: correctly routes AUTO_RESOLVE / CLARIFY / ESCALATE in unit tests
-- [ ] Escalator: creates a ticket in Postgres and stores context in Redis
+- [ ] Resolver: `answer_conf` is populated from `search_kb`'s top `rerank_score` (not hardcoded), and `kb_sources` captures citations for every KB-grounded turn
+- [ ] Confidence gate: correctly routes AUTO_RESOLVE / CLARIFY / ESCALATE in unit tests, using the *real* hybrid-search relevance score as `answer_conf`
+- [ ] Escalator: creates a ticket in Postgres and stores context (including `kb_sources` + `answer_conf`) in Redis
 - [ ] Full call demo: ask a billing question → classify → resolve with CRM → confirmation email sent
-- [ ] Full call demo: say "I want a human" → escalate within 1 turn → ticket created
+- [ ] Full call demo: ask a how-to question with a paraphrased/awkward phrasing → hybrid search still grounds the answer correctly and `answer_conf` reflects genuine relevance
+- [ ] Full call demo: say "I want a human" → escalate within 1 turn → ticket created, with KB sources the bot already considered visible to the human agent
 
 ---
 

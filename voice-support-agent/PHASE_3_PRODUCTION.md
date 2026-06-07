@@ -331,6 +331,55 @@ def gate(ctx) -> str:
         return "ESCALATE"
 ```
 
+**Instrument the hybrid search pipeline** — Phase 1 built `search_kb` as four discrete stages (vector search → BM25 search → RRF fusion → cross-encoder rerank). In production you want to see each stage's timing and output independently — if resolve rates dip, this is how you tell whether the problem is "vector search missed it," "BM25 missed it," or "the reranker picked the wrong candidate":
+
+```python
+# mcp_servers/kb_mcp/hybrid_search.py — updated with tracing (wraps the Phase 1 `search` function)
+from observability.tracing import get_tracer
+
+def search(query: str) -> list[dict]:
+    tracer = get_tracer()
+    with tracer.start_as_current_span("kb.hybrid_search") as span:
+        span.set_attribute("kb.query", query)
+
+        with tracer.start_as_current_span("kb.vector_search") as s:
+            vec_results = vector_search(query, n_results=VECTOR_TOP_K)
+            s.set_attribute("kb.vector.result_count", len(vec_results))
+            s.set_attribute("kb.vector.top_score", vec_results[0]["score"] if vec_results else 0.0)
+
+        with tracer.start_as_current_span("kb.bm25_search") as s:
+            bm25_results = _bm25_search(query, top_k=BM25_TOP_K)
+            s.set_attribute("kb.bm25.result_count", len(bm25_results))
+
+        with tracer.start_as_current_span("kb.rrf_fusion") as s:
+            fused = _fuse_rrf(vec_results, bm25_results)
+            s.set_attribute("kb.fusion.candidate_count", len(fused))
+            # how much do the two methods agree? useful for spotting KB gaps
+            overlap = len({r["text"] for r in vec_results} & {r["text"] for r in bm25_results})
+            s.set_attribute("kb.fusion.overlap_count", overlap)
+
+        with tracer.start_as_current_span("kb.rerank") as s:
+            final = _rerank(query, fused[:max(VECTOR_TOP_K, BM25_TOP_K)], top_n=RERANK_TOP_N)
+            s.set_attribute("kb.rerank.top_score", final[0]["rerank_score"] if final else 0.0)
+            s.set_attribute("kb.rerank.sources",
+                            ",".join(r["metadata"]["doc_name"] for r in final))
+
+        span.set_attribute("kb.final_count", len(final))
+        return final
+```
+
+This gives you a Jaeger trace tree like:
+
+```
+kb.hybrid_search  (total: 340ms)
+ ├─ kb.vector_search   (90ms)   result_count=10  top_score=0.81
+ ├─ kb.bm25_search     (15ms)   result_count=10
+ ├─ kb.rrf_fusion       (2ms)   candidate_count=14  overlap_count=6
+ └─ kb.rerank          (230ms)  top_score=0.93  sources="billing_faq.txt"
+```
+
+— so if a customer's question wasn't answered well, you can see at a glance *which stage* let it down (e.g., `overlap_count=0` means the two retrieval methods disagreed completely — a sign your KB might be missing that topic, or the query needs better preprocessing).
+
 ---
 
 ### Step 5 — Prometheus Metrics
@@ -355,6 +404,22 @@ ttfr_seconds      = Histogram("vt_time_to_first_response_seconds",
                                buckets=[0.3, 0.5, 0.8, 1.2, 2.0, 5.0])
 conf_score        = Histogram("vt_confidence_score", "Gate confidence scores",
                                buckets=[0.1, 0.3, 0.5, 0.6, 0.7, 0.85, 0.95, 1.0])
+
+# ── Hybrid search / retrieval quality (NEW — instruments each KB stage) ──
+kb_stage_latency  = Histogram("vt_kb_stage_latency_seconds",
+                               "Latency of each hybrid-search stage",
+                               ["stage"],   # vector | bm25 | fusion | rerank
+                               buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0])
+kb_rerank_score   = Histogram("vt_kb_rerank_score",
+                               "Top-result relevance score after reranking "
+                               "(this is what feeds answer_conf)",
+                               buckets=[0.1, 0.3, 0.5, 0.6, 0.7, 0.85, 0.95, 1.0])
+kb_retrieval_overlap = Histogram("vt_kb_retrieval_overlap_count",
+                               "How many chunks vector search and BM25 agreed on "
+                               "(low overlap can signal a KB content gap)",
+                               buckets=[0, 1, 2, 3, 5, 10])
+kb_empty_results  = Counter("vt_kb_empty_results_total",
+                               "Queries where hybrid search returned nothing")
 
 # gauges
 active_calls = Gauge("vt_active_calls", "Calls in progress")
@@ -593,30 +658,91 @@ http {
     "input": "Let me talk to a real person",
     "expected_intent": "other",
     "expected_outcome": "ESCALATE"
+  },
+  {
+    "id": "tc005",
+    "comment": "RETRIEVAL CHECK — paraphrased phrasing should still hit the right doc via semantic search",
+    "input": "I forgot the password to my account, what do I do",
+    "expected_intent": "account_password_reset",
+    "expected_outcome": "AUTO_RESOLVE",
+    "expected_tool_called": "search_kb",
+    "expected_kb_source": "reset_password.txt",
+    "min_rerank_score": 0.60
+  },
+  {
+    "id": "tc006",
+    "comment": "RETRIEVAL CHECK — exact term (error code) should be caught by the BM25/keyword half of hybrid search",
+    "input": "I'm getting error E4042 when I try to check out",
+    "expected_intent": "technical_bug",
+    "expected_outcome": "CLARIFY",
+    "expected_tool_called": "search_kb",
+    "expected_kb_source": "billing_faq.txt",
+    "min_rerank_score": 0.50
+  },
+  {
+    "id": "tc007",
+    "comment": "RETRIEVAL CHECK — ambiguous query that could match multiple sections; reranker should pick the best one",
+    "input": "what's your policy on returns",
+    "expected_intent": "order_return",
+    "expected_outcome": "AUTO_RESOLVE",
+    "expected_tool_called": "search_kb",
+    "expected_kb_source": "shipping_policy.txt",
+    "min_rerank_score": 0.55
+  },
+  {
+    "id": "tc008",
+    "comment": "RETRIEVAL CHECK — out-of-KB question should return low relevance, not a confident wrong answer",
+    "input": "what's the weather like today",
+    "expected_intent": "other",
+    "expected_outcome": "ESCALATE",
+    "expected_tool_called": "search_kb",
+    "max_rerank_score": 0.40
   }
 ]
 ```
 
 ```python
 # evals/run_evals.py — headless eval runner
+# Now exercises the REAL hybrid search pipeline (vector + BM25 + fusion + rerank)
+# instead of mocking answer_conf — this is what actually catches retrieval
+# regressions (e.g. a chunking change that quietly breaks one doc's matches).
 import asyncio, json
 from agent.classifier import classify
 from agent.confidence_gate import gate
 from agent.context import CallContext
+from mcp_servers.kb_mcp.hybrid_search import search as kb_search
 import uuid
 
 async def run_eval(case: dict) -> dict:
     ctx = CallContext(session_id=str(uuid.uuid4()))
     ctx = await classify(case["input"], ctx)
-    # mock answer confidence for eval
-    ctx.answer_conf = 0.90 if ctx.intent_tag != "other" else 0.30
+
+    # Run the REAL hybrid search pipeline — no mocking
+    kb_results = kb_search(case["input"])
+    if kb_results:
+        ctx.answer_conf = kb_results[0]["rerank_score"]
+        ctx.kb_sources  = [r["metadata"]["doc_name"] for r in kb_results]
+    else:
+        ctx.answer_conf = 0.0
+        ctx.kb_sources  = []
+
     decision = gate(ctx)
-    passed = (
-        ctx.intent_tag == case["expected_intent"] and
-        decision == case["expected_outcome"]
-    )
-    return {"id": case["id"], "passed": passed,
+
+    checks = {
+        "intent_match":    ctx.intent_tag == case["expected_intent"],
+        "decision_match":  decision == case["expected_outcome"],
+    }
+    if "expected_kb_source" in case:
+        checks["kb_source_match"] = case["expected_kb_source"] in ctx.kb_sources
+    if "min_rerank_score" in case:
+        checks["rerank_score_floor"] = ctx.answer_conf >= case["min_rerank_score"]
+    if "max_rerank_score" in case:
+        checks["rerank_score_ceiling"] = ctx.answer_conf <= case["max_rerank_score"]
+
+    passed = all(checks.values())
+    return {"id": case["id"], "passed": passed, "checks": checks,
             "intent": ctx.intent_tag, "decision": decision,
+            "answer_conf": round(ctx.answer_conf, 2), "kb_sources": ctx.kb_sources,
             "expected_intent": case["expected_intent"],
             "expected_outcome": case["expected_outcome"]}
 
@@ -629,8 +755,10 @@ async def main():
     print(f"{'='*50}\n")
     for r in results:
         status = "✅" if r["passed"] else "❌"
-        print(f"{status} {r['id']} | intent: {r['intent']} | "
-              f"decision: {r['decision']}")
+        failed_checks = [k for k, v in r["checks"].items() if not v]
+        extra = f" | failed: {failed_checks}" if failed_checks else ""
+        print(f"{status} {r['id']} | intent: {r['intent']} | decision: {r['decision']} "
+              f"| answer_conf: {r['answer_conf']} | kb_sources: {r['kb_sources']}{extra}")
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -639,6 +767,8 @@ if __name__ == "__main__":
 ```bash
 python evals/run_evals.py
 ```
+
+> **Why run real hybrid search in evals instead of mocking it?** Mocked confidence values can't catch retrieval regressions — e.g., if you tweak `KB_CHUNK_MAX_WORDS` and it quietly breaks matching for one document, a mock would never notice. Running the actual pipeline means the eval suite doubles as a regression test for your chunking, indexing, fusion, and reranking — the exact stages most likely to silently degrade as your KB grows toward "1000 pages."
 
 ---
 
@@ -651,6 +781,10 @@ python evals/run_evals.py
 | `vt_confidence_score` histogram | peak > 0.85 | many calls < 0.60 |
 | `vt_calls_escalated_total` | < 30% of calls | > 50% |
 | `vt_tool_calls_total{tool="search_kb"}` | — | sudden drop (KB down?) |
+| `vt_kb_stage_latency_seconds{stage="rerank"} p95` | < 200ms | > 500ms (reranker is the slowest hybrid-search stage — watch it first) |
+| `vt_kb_rerank_score` histogram | peak > 0.6 | many searches < 0.4 (KB content gap or chunking regression) |
+| `vt_kb_retrieval_overlap_count` | — | consistently 0 (vector and BM25 never agree → fusion isn't adding value, investigate) |
+| `vt_kb_empty_results_total` | near 0 | rising trend (queries the KB has no answer for — candidates for new docs) |
 
 ---
 
@@ -678,7 +812,9 @@ python evals/run_evals.py
 - [ ] Grafana dashboard shows live call volume and resolve rate
 - [ ] Human dashboard shows escalations in real time
 - [ ] Nginx serves dashboard + Grafana over HTTPS
-- [ ] Eval suite passes ≥ 80% of annotated test cases
+- [ ] Eval suite passes ≥ 80% of annotated test cases — including the retrieval-quality cases (tc005–tc008) that exercise the real hybrid search pipeline, not a mocked `answer_conf`
+- [ ] Jaeger shows the full hybrid search span tree (`kb.hybrid_search` → `vector_search` / `bm25_search` / `rrf_fusion` / `rerank`) with latency and score attributes on each
+- [ ] Grafana dashboard includes the four `vt_kb_*` retrieval-quality panels (stage latency, rerank score distribution, retrieval overlap, empty-result rate)
 - [ ] All secrets rotated from dev values (devkey, changeme) to strong random strings
 
 ---
