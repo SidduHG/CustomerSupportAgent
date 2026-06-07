@@ -1,0 +1,18 @@
+# Local-only progress tracker — never push
+TRACKER.md
+
+# Secrets
+.env
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Knowledge base / vector store
+chroma_store/
+
+# OS / editor
+.DS_Store
