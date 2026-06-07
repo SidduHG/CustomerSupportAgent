@@ -20,9 +20,20 @@ def _get(key: str, default: str) -> str:
 
 
 def _get_int(key: str, default: int) -> int:
-    """Read an integer env var, falling back to ``default`` when unset/empty."""
+    """Read an integer env var, falling back to ``default`` when unset/empty.
+
+    Raises a clear RuntimeError on a non-empty, non-numeric value rather than
+    leaking a bare ValueError from int().
+    """
     value = os.getenv(key)
-    return int(value) if value not in (None, "") else default
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Environment variable {key}={value!r} is not a valid integer."
+        ) from exc
 
 
 @dataclass(frozen=True)

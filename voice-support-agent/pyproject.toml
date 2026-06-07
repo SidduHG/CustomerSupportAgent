@@ -3,5 +3,5 @@
 # pythonpath="." lets tests import the `agent` and `mcp_servers` packages.
 pythonpath = ["."]
 testpaths = ["tests"]
-addopts = "-ra"
+addopts = "-ra --import-mode=importlib"
 asyncio_mode = "auto"

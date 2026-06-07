@@ -1,4 +1,6 @@
 """Unit tests for the config layer (settings + constants)."""
+from dataclasses import FrozenInstanceError
+
 import pytest
 
 from agent.config.settings import Settings
@@ -44,6 +46,13 @@ def test_int_parsing_handles_empty(monkeypatch):
     assert s.kb_mcp_port == 8000
 
 
+def test_int_parsing_raises_on_garbage(monkeypatch):
+    # A non-numeric value should raise a clear RuntimeError, not a bare ValueError.
+    monkeypatch.setenv("KB_MCP_PORT", "not-a-number")
+    with pytest.raises(RuntimeError):
+        Settings.from_env()
+
+
 def test_require_groq_key_raises_when_missing(monkeypatch):
     monkeypatch.setenv("GROQ_API_KEY", "")
     s = Settings.from_env()
@@ -59,7 +68,7 @@ def test_require_groq_key_ok_when_set(monkeypatch):
 
 def test_settings_is_immutable(monkeypatch):
     s = Settings.from_env()
-    with pytest.raises(Exception):
+    with pytest.raises(FrozenInstanceError):
         s.kb_mcp_port = 1234  # frozen dataclass
 
 
