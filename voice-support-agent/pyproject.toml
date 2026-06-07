@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Run pytest from the voice-support-agent/ directory.
+# pythonpath="." lets tests import the `agent` and `mcp_servers` packages.
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --import-mode=importlib"
+asyncio_mode = "auto"
