@@ -26,6 +26,7 @@ RRF_K = 60  # standard Reciprocal Rank Fusion damping constant
 
 _bm25_chunks: list[dict] = []
 _bm25_index: BM25Okapi | None = None
+_bm25_built = False
 _bm25_lock = Lock()
 
 
@@ -39,18 +40,20 @@ def rebuild_bm25_index() -> int:
 
     Returns the number of chunks indexed.
     """
-    global _bm25_chunks, _bm25_index
+    global _bm25_chunks, _bm25_index, _bm25_built
     with _bm25_lock:
         _bm25_chunks = all_chunks()
         tokenized = [_tokenize(c["text"]) for c in _bm25_chunks]
         _bm25_index = BM25Okapi(tokenized) if tokenized else None
+        _bm25_built = True
     logger.info("BM25 index built | {} chunks", len(_bm25_chunks))
     return len(_bm25_chunks)
 
 
 def _ensure_bm25_index() -> None:
-    """Build the index on first use if it hasn't been built yet."""
-    if _bm25_index is None and not _bm25_chunks:
+    """Build the index on first use. A ``_bm25_built`` sentinel means a genuinely
+    empty corpus isn't re-fetched from ChromaDB on every search."""
+    if not _bm25_built:
         rebuild_bm25_index()
 
 
@@ -58,14 +61,19 @@ def _bm25_search(query: str, top_k: int) -> list[dict]:
     """Lexical search. Returns up to ``top_k`` chunks with a positive BM25
     score (zero-score chunks share no terms with the query and are dropped)."""
     _ensure_bm25_index()
-    if _bm25_index is None:
+    # Snapshot both globals together under the lock so a concurrent rebuild
+    # can't swap the index out from under the chunk list mid-search.
+    with _bm25_lock:
+        index = _bm25_index
+        chunks = _bm25_chunks
+    if index is None:
         return []
-    scores = _bm25_index.get_scores(_tokenize(query))
+    scores = index.get_scores(_tokenize(query))
     ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
     return [
         {
-            "text": _bm25_chunks[i]["text"],
-            "metadata": _bm25_chunks[i]["metadata"],
+            "text": chunks[i]["text"],
+            "metadata": chunks[i]["metadata"],
             "score": float(scores[i]),
         }
         for i in ranked
@@ -129,7 +137,11 @@ def search(query: str) -> list[dict]:
     vec_results = vector_search(query, n_results=settings.kb_vector_top_k)
     bm25_results = _bm25_search(query, top_k=settings.kb_bm25_top_k)
     fused = _fuse_rrf(vec_results, bm25_results)
-    candidate_cap = max(settings.kb_vector_top_k, settings.kb_bm25_top_k)
+    # Cap by the SUM, not the max: the fused list can hold up to
+    # vector_top_k + bm25_top_k distinct chunks, and the lower-RRF single-list
+    # hits are exactly the strong-only matches the cross-encoder exists to
+    # rescue — truncating to max() would discard them before reranking.
+    candidate_cap = settings.kb_vector_top_k + settings.kb_bm25_top_k
     final = _rerank(query, fused[:candidate_cap], top_n=settings.kb_rerank_top_n)
     logger.info(
         "Hybrid search | query='{}' vector={} bm25={} fused={} final={}",

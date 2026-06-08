@@ -9,6 +9,7 @@ import mcp_servers.kb_mcp.hybrid_search as hs
 def _reset_index():
     hs._bm25_chunks = []
     hs._bm25_index = None
+    hs._bm25_built = False
 
 
 def test_rrf_fusion_prioritizes_overlap():
