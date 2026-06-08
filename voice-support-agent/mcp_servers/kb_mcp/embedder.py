@@ -11,6 +11,7 @@ they actually need one.
 from __future__ import annotations
 
 import glob
+import os
 from functools import lru_cache
 
 from loguru import logger
@@ -40,7 +41,12 @@ def _get_embedder():
 
 def _get_collection():
     settings = get_settings()
-    return _get_client().get_or_create_collection(settings.kb_collection_name)
+    # Use cosine space so vector_search's (1 - distance) is a true similarity in
+    # ~[0, 1]. Chroma defaults to L2, which would make scores unbounded and
+    # mislead F2's fusion/reranking even though raw ordering stays correct.
+    return _get_client().get_or_create_collection(
+        settings.kb_collection_name, metadata={"hnsw:space": "cosine"}
+    )
 
 
 def ingest_directory(docs_dir: str) -> int:
@@ -59,13 +65,13 @@ def ingest_directory(docs_dir: str) -> int:
         records = chunk_document(fp)
         if not records:
             continue
+        # Use the path relative to docs_dir in the ID so same-named files in
+        # different subdirectories don't collide and overwrite on upsert.
+        rel_path = os.path.relpath(fp, docs_dir).replace(os.sep, "/")
         texts = [r["text"] for r in records]
         metadatas = [r["metadata"] for r in records]
         embeddings = embedder.encode(texts).tolist()
-        ids = [
-            f"{r['metadata']['doc_name']}-chunk-{r['metadata']['chunk_index']}"
-            for r in records
-        ]
+        ids = [f"{rel_path}-chunk-{r['metadata']['chunk_index']}" for r in records]
         collection.upsert(
             documents=texts, embeddings=embeddings, metadatas=metadatas, ids=ids
         )
@@ -75,10 +81,15 @@ def ingest_directory(docs_dir: str) -> int:
     return total
 
 
-def vector_search(query: str, n_results: int = 10) -> list[dict]:
+def vector_search(query: str, n_results: int | None = None) -> list[dict]:
     """Semantic search: chunks whose embeddings are closest in meaning to the
     query. Each result keeps its text, metadata, and a similarity score.
+
+    ``n_results`` defaults to the ``KB_VECTOR_TOP_K`` setting.
     """
+    settings = get_settings()
+    if n_results is None:
+        n_results = settings.kb_vector_top_k
     embedder = _get_embedder()
     collection = _get_collection()
     vec = embedder.encode([query]).tolist()

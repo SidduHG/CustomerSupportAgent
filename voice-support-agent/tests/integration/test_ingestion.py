@@ -65,9 +65,13 @@ def test_vector_search_returns_scored_results(kb):
 
 
 def test_results_are_sorted_by_score(kb):
-    results = kb.vector_search("shipping time", n_results=5)
+    results = kb.vector_search("how long does shipping take", n_results=5)
     scores = [r["score"] for r in results]
     assert scores == sorted(scores, reverse=True)
+    # The shipping doc should be the top hit for a shipping query (not just sorted).
+    assert results[0]["metadata"]["doc_name"] == "shipping.md"
+    # Cosine space keeps the similarity score within a sane bound.
+    assert results[0]["score"] <= 1.0001
 
 
 def test_all_chunks_returns_everything(kb):

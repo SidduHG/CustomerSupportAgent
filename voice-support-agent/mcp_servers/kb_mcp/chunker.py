@@ -88,9 +88,11 @@ def chunk_document(
     sections = _split_into_sections(text)
     records: list[dict] = []
     chunk_idx = 0
+    non_empty_sections = 0
     for heading, section_text in sections:
         if not section_text:
             continue
+        non_empty_sections += 1
         for piece in _chunk_section(section_text, max_words, overlap_sentences):
             records.append(
                 {
@@ -108,6 +110,6 @@ def chunk_document(
         "Chunked {} -> {} chunks across {} section(s)",
         doc_name,
         len(records),
-        len(sections),
+        non_empty_sections,
     )
     return records
